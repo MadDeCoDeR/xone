@@ -11,6 +11,10 @@
 #include "common.h"
 #include "../auth/auth.h"
 
+ushort trigger_rumble_mode = 0;
+MODULE_PARM_DESC(trigger_rumble_mode, "Trigger rumble mode. 0: disable, 1: pressure.");
+module_param(trigger_rumble_mode, ushort, 0644);
+
 #define GIP_GP_NAME "Microsoft Xbox Controller"
 
 #define GIP_VENDOR_MICROSOFT 0x045e
@@ -26,7 +30,9 @@
 #define GIP_ELITE_SERIES_2_510_FIRMWARE 0x050A
 
 #define GIP_GP_RUMBLE_DELAY msecs_to_jiffies(10)
+#define GIP_GP_RUMBLE_TRIGGER_DELAY msecs_to_jiffies(50)
 #define GIP_GP_RUMBLE_MAX 100
+#define GIP_GP_RUMBLE_TRIGGER_MAX 100
 
 /* button offset from end of packet */
 #define GIP_GP_BTN_SHARE_OFFSET 18
@@ -131,6 +137,16 @@ struct gip_gamepad_rumble {
 	struct timer_list timer;
 	struct gip_gamepad_pkt_rumble pkt;
 
+	u8 main_left;
+	u8 main_right;
+	u8 trig_pos_left;
+	u8 trig_pos_right;
+
+	u16 old_mag_left;
+	u16 old_mag_right;
+	u16 old_trig_left;
+	u16 old_trig_right;
+
 	struct gip_gamepad *parent;
 };
 
@@ -161,7 +177,17 @@ static void gip_gamepad_send_rumble(struct timer_list *timer)
 	struct gip_gamepad *gamepad = rumble->parent;
 	unsigned long flags;
 
+	//GK: Replicate behaviour from Windows Driver. Disable Rumble effects if battery is low
+	if (gamepad->battery.capacity == POWER_SUPPLY_CAPACITY_LEVEL_LOW) {
+		return;
+	}
+
 	spin_lock_irqsave(&rumble->lock, flags);
+
+	rumble->pkt.left = rumble->main_left;
+	rumble->pkt.right = rumble->main_right;
+	rumble->pkt.left_trigger = rumble->trig_pos_left;
+	rumble->pkt.right_trigger = rumble->trig_pos_right;
 
 	gip_send_rumble(gamepad->client, &rumble->pkt, sizeof(rumble->pkt));
 	rumble->last = jiffies;
@@ -173,17 +199,32 @@ static int gip_gamepad_queue_rumble(struct input_dev *dev, void *data,
 				    struct ff_effect *effect)
 {
 	struct gip_gamepad_rumble *rumble = input_get_drvdata(dev);
-	u16 mag_left = effect->u.rumble.strong_magnitude;
-	u16 mag_right = effect->u.rumble.weak_magnitude;
+	u16 mag_left = rumble->old_mag_left;
+	u16 mag_right = rumble->old_mag_right;
+	u16 trigger_left = rumble->old_trig_left;
+	u16 trigger_right = rumble->old_trig_right;
 	unsigned long flags;
 
 	if (effect->type != FF_RUMBLE)
 		return 0;
 
+	if (effect->direction == 0x8000) {
+		trigger_left = effect->u.rumble.strong_magnitude;
+		trigger_right = effect->u.rumble.weak_magnitude;
+	} else {
+		mag_left = effect->u.rumble.strong_magnitude;
+		mag_right = effect->u.rumble.weak_magnitude;
+	}
 	spin_lock_irqsave(&rumble->lock, flags);
 
-	rumble->pkt.left = mag_left * GIP_GP_RUMBLE_MAX / U16_MAX;
-	rumble->pkt.right = mag_right * GIP_GP_RUMBLE_MAX / U16_MAX;
+	rumble->old_mag_left = mag_left;
+	rumble->old_mag_right = mag_right;
+	rumble->old_trig_left = trigger_left;
+	rumble->old_trig_right = trigger_right;
+	rumble->main_left = (mag_left * GIP_GP_RUMBLE_MAX) / U16_MAX;
+	rumble->main_right = (mag_right * GIP_GP_RUMBLE_MAX) / U16_MAX;
+	rumble->trig_pos_left = (trigger_left * GIP_GP_RUMBLE_TRIGGER_MAX) / U16_MAX;
+	rumble->trig_pos_right = (trigger_right * GIP_GP_RUMBLE_TRIGGER_MAX ) / U16_MAX;
 
 	/* delay rumble to work around firmware bug */
 	if (!timer_pending(&rumble->timer))
@@ -208,6 +249,10 @@ static int gip_gamepad_init_rumble(struct gip_gamepad *gamepad)
 	rumble->pkt.duration = 0xff;
 	rumble->pkt.repeat = 0xeb;
 	rumble->parent = gamepad;
+	rumble->old_mag_left = 0;
+	rumble->old_mag_right = 0;
+	rumble->old_trig_left = 0;
+	rumble->old_trig_right = 0;
 	gip_gamepad_send_rumble(&rumble->timer);
 
 	input_set_capability(dev, EV_FF, FF_RUMBLE);
@@ -379,14 +424,29 @@ static int gip_gamepad_op_firmware(struct gip_client *client, void *data,
 static int gip_gamepad_op_input(struct gip_client *client, void *data, u32 len)
 {
 	struct gip_gamepad *gamepad = dev_get_drvdata(&client->dev);
+	struct gip_gamepad_rumble *rumble = &gamepad->rumble;
 	struct gip_gamepad_pkt_input *pkt = data;
 	struct input_dev *dev = gamepad->input.dev;
 	u16 buttons;
 	u8 share_offset = GIP_GP_BTN_SHARE_OFFSET;
+	unsigned long flags;
 
 	if (len < sizeof(*pkt))
 		return -EINVAL;
 
+	if (trigger_rumble_mode == 1) {
+	
+		spin_lock_irqsave(&rumble->lock, flags);
+
+		rumble->trig_pos_left = le16_to_cpu(pkt->trigger_left);
+		rumble->trig_pos_right = le16_to_cpu(pkt->trigger_right);
+
+		/* delay rumble to work around firmware bug */
+		if (!timer_pending(&rumble->timer) && trigger_rumble_mode == 1)
+			mod_timer(&rumble->timer, rumble->last + GIP_GP_RUMBLE_TRIGGER_DELAY);
+
+		spin_unlock_irqrestore(&rumble->lock, flags);
+	}
 	buttons = le16_to_cpu(pkt->buttons);
 
 	/* share button byte is always at fixed offset from end of packet */
