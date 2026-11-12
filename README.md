@@ -15,6 +15,11 @@
 > 
 > Huge thanks to medusalix for all the work and creating this driver!
 
+> [!NOTE]
+> This is a sample fork that shows a way to implement Impulse Trigger effects **WITHOUT** changing the Linux Kernel (ff_event Direction **HACK**)
+> 
+> You can find patches (SDL3 only for now) that shows how to use that implementation
+
 ## Compatibility
 
 - [x] Wired devices (via USB)
