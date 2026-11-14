@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include "../auth/auth.h"
+#include "../transport/dongle.h"
 
 ushort trigger_rumble_mode = 3;
 MODULE_PARM_DESC(trigger_rumble_mode, "Trigger rumble mode. 0: disable, 1: reserved, 2: pressure, 3: enable(event direction HACK).");
@@ -36,6 +37,9 @@ module_param(trigger_rumble_mode, ushort, 0644);
 
 /* button offset from end of packet */
 #define GIP_GP_BTN_SHARE_OFFSET 18
+
+//GK: Deadzone for the joysticks in order to count as valid input and prevent auto suspend on the wireless dongle
+#define GIP_HAT_VALID_DEADZONE 2500
 
 /* fallback for kernels < 6.17 */
 #ifndef BTN_GRIPR
@@ -392,12 +396,60 @@ static int gip_gamepad_op_firmware(struct gip_client *client, void *data,
 	return 0;
 }
 
+static u64 gip_gamepad_valid_input(struct gip_client *client, void* data, u32 len) {
+	u64 hasInput = 0;
+	struct gip_gamepad *gamepad = dev_get_drvdata(&client->dev);
+	struct gip_gamepad_pkt_input *pkt = data;
+	u16 buttons;
+	u8 share_offset = GIP_GP_BTN_SHARE_OFFSET;
+	unsigned long flags;
+	hasInput += le16_to_cpu(pkt->buttons);
+
+	/* share button byte is always at fixed offset from end of packet */
+	if (gamepad->supports_share) {
+		if (gamepad->supports_dli)
+			share_offset += sizeof(struct gip_gamepad_pkt_dli);
+
+		if (len < share_offset)
+			return -EINVAL;
+
+		hasInput += ((u8 *)data)[len - share_offset];
+	}
+
+	if (gamepad->paddle_support == PADDLE_ELITE2_510 && len > 18) {
+		hasInput += ((u8 *)data)[18];
+
+	} else if (gamepad->paddle_support == PADDLE_ELITE2_4X && len > 14) {
+		hasInput += ((u8 *)data)[14];
+
+	} else if (gamepad->paddle_support == PADDLE_ELITE && len > 28) {
+		hasInput += ((u8 *)data)[28];
+	}
+
+	hasInput += ((s16)le16_to_cpu(pkt->stick_left_x) / GIP_HAT_VALID_DEADZONE);
+	hasInput += ((s16)le16_to_cpu(pkt->stick_right_x) / GIP_HAT_VALID_DEADZONE);
+	hasInput += (~(s16)le16_to_cpu(pkt->stick_left_y) / GIP_HAT_VALID_DEADZONE);
+	hasInput += (~(s16)le16_to_cpu(pkt->stick_right_y) / GIP_HAT_VALID_DEADZONE);
+	hasInput += le16_to_cpu(pkt->trigger_left);
+	hasInput += le16_to_cpu(pkt->trigger_right);
+	hasInput +=  !!(buttons & GIP_GP_BTN_DPAD_R) -
+					 !!(buttons & GIP_GP_BTN_DPAD_L);
+	hasInput +=  !!(buttons & GIP_GP_BTN_DPAD_D) -
+					 !!(buttons & GIP_GP_BTN_DPAD_U);
+	//dev_dbg(&client->dev, "%s: Has Input %d\n", __func__, hasInput); //GK: ONLY for Debugging
+	return hasInput;
+}
+
 static int gip_gamepad_op_input(struct gip_client *client, void *data, u32 len)
 {
 	struct gip_gamepad *gamepad = dev_get_drvdata(&client->dev);
 	struct gip_gamepad_rumble *rumble = &gamepad->rumble;
 	struct gip_gamepad_pkt_input *pkt = data;
 	struct input_dev *dev = gamepad->input.dev;
+	struct xone_dongle_client *dongle = NULL;
+	if (gamepad->battery.status == POWER_SUPPLY_STATUS_DISCHARGING) {
+		dongle = dev_get_drvdata(&gamepad->client->adapter->dev);
+	}
 	u16 buttons;
 	u8 share_offset = GIP_GP_BTN_SHARE_OFFSET;
 	unsigned long flags;
@@ -504,6 +556,9 @@ static int gip_gamepad_op_input(struct gip_client *client, void *data, u32 len)
 	input_report_abs(dev, ABS_HAT0Y, !!(buttons & GIP_GP_BTN_DPAD_D) -
 					 !!(buttons & GIP_GP_BTN_DPAD_U));
 	input_sync(dev);
+	if (dongle != NULL && gip_gamepad_valid_input(client, data, len) != 0) {
+		pm_runtime_mark_last_busy(&dongle->dongle->mt.udev->dev);
+	}
 	return 0;
 }
 
